@@ -1,0 +1,3 @@
+.proxygen_cache.json
+.proxygen-*.tmp
+__pycache__/
