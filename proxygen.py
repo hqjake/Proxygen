@@ -1,211 +1,263 @@
-import requests
+import argparse
+import os
+import re
+import tempfile
 import threading
 import time
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+
+import requests
 from rich.console import Console
 from rich.panel import Panel
-import os
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 
 # --- Configuration ---
 SOURCES = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
     "https://raw.githubusercontent.com/Thordata/awesome-free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/Munachukwuw/Best-Free-Proxies/main/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http",
-    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt"
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
 ]
 
 OUTPUT_FILE = "proxies.txt"
-THREADS = 75
+THREADS = 200
+CONNECT_TIMEOUT = 3
 TIMEOUT = 5
+SOURCE_TIMEOUT = 10
 TEST_URL = "http://httpbin.org/ip"
+EXPECT = "origin"  # Substring the test response must contain (catches captive/garbage pages)
+MAX_BODY_BYTES = 64 * 1024
+USER_AGENT = "Mozilla/5.0"
+
+# Matches ip:port anywhere in a line, so "http://1.2.3.4:8080" and "1.2.3.4:8080 US" both parse.
+PROXY_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})(?!\d)")
 
 console = Console()
-file_lock = threading.Lock()
-stats = {"found": 0, "scanned": 0, "failed": 0}
-stats_lock = threading.Lock()
+_local = threading.local()
 
-def test_worker(q):
-    while not q.empty():
-        try:
-            proxy = q.get_nowait()
-        except:
-            break
-            
-        try:
-            # Test proxy
-            proxies = {
-                "http": f"http://{proxy}", 
-                "https": f"http://{proxy}"
-            }
-            
-            start_time = time.time()
-            r = requests.get(
-                TEST_URL, 
-                proxies=proxies, 
-                timeout=TIMEOUT,
-                headers={'User-Agent': 'Mozilla/5.0'}  # Add user agent
-            )
-            latency = round((time.time() - start_time) * 1000)
-            
-            if r.status_code == 200:
-                # Debug output
-                console.print(f"[bold green][ALIVE][/bold green] {proxy:<22} | [cyan]{latency}ms[/cyan]")
-                
-                # Write to file with immediate flush
-                with file_lock:
-                    try:
-                        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-                            f.write(f"{proxy}\n")
-                            f.flush()  # Force write to disk
-                            os.fsync(f.fileno())  # Ensure it's written to disk
-                    except Exception as e:
-                        console.print(f"[red]Error writing to file: {e}[/red]")
-                
-                with stats_lock:
-                    stats["found"] += 1
-            else:
-                with stats_lock:
-                    stats["failed"] += 1
-                    
-        except requests.exceptions.Timeout:
-            with stats_lock:
-                stats["failed"] += 1
-        except requests.exceptions.ConnectionError:
-            with stats_lock:
-                stats["failed"] += 1
-        except Exception as e:
-            with stats_lock:
-                stats["failed"] += 1
-        finally:
-            with stats_lock:
-                stats["scanned"] += 1
-            q.task_done()
 
-def verify_file_writing():
-    """Test if file writing works"""
+def get_session():
+    """One Session per worker thread, so connection setup objects are reused."""
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False  # Skip env/netrc proxy lookups on every request
+        session.headers["User-Agent"] = USER_AGENT
+        _local.session = session
+    return session
+
+
+def parse_proxies(text):
+    """Extract unique, well-formed ip:port pairs from raw source text."""
+    found = set()
+    for ip, port in PROXY_RE.findall(text):
+        if 0 < int(port) <= 65535 and all(int(octet) <= 255 for octet in ip.split(".")):
+            found.add(f"{ip}:{int(port)}")
+    return found
+
+
+def source_name(url):
+    """Short label for a source: the repo owner for GitHub raw URLs, else the host."""
+    parts = urlparse(url)
+    if parts.netloc == "raw.githubusercontent.com":
+        return parts.path.strip("/").split("/")[0]
+    return parts.netloc
+
+
+def fetch_source(url):
+    res = requests.get(url, timeout=SOURCE_TIMEOUT, headers={"User-Agent": USER_AGENT})
+    res.raise_for_status()
+    return parse_proxies(res.text)
+
+
+def fetch_all_sources(sources):
+    """Fetch every source concurrently and return the deduplicated proxy set."""
+    proxies = set()
+    with ThreadPoolExecutor(max_workers=len(sources)) as pool:
+        futures = {pool.submit(fetch_source, url): url for url in sources}
+        for future in as_completed(futures):
+            name = source_name(futures[future])
+            try:
+                extracted = future.result()
+                proxies.update(extracted)
+                console.print(f"  [green]✓[/green] {name:<20} → {len(extracted)} proxies")
+            except Exception as e:
+                console.print(f"  [red]✗ {name:<20} → Failed: {str(e)[:60]}[/red]")
+    return proxies
+
+
+def check_proxy(proxy, args):
+    """Return latency in ms if the proxy works, otherwise None."""
+    session = get_session()
+    proxy_url = f"http://{proxy}"
     try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write("# Proxy List - Generated by scraper\n")
-            f.flush()
-        console.print("[green]✓ File write test successful[/green]")
-        return True
-    except Exception as e:
-        console.print(f"[red]✗ File write test failed: {e}[/red]")
-        return False
+        start = time.perf_counter()
+        with session.get(
+            args.test_url,
+            proxies={"http": proxy_url, "https": proxy_url},
+            timeout=(args.connect_timeout, args.timeout),
+            stream=True,
+            allow_redirects=False,
+        ) as r:
+            if r.status_code != 200:
+                return None
+            # Read a bounded amount so misbehaving proxies can't stream huge bodies at us.
+            body = r.raw.read(MAX_BODY_BYTES, decode_content=True)
+        latency = round((time.perf_counter() - start) * 1000)
+        if args.expect and args.expect.encode() not in body:
+            return None
+        return latency
+    except Exception:
+        return None
+    finally:
+        # requests caches a ProxyManager per proxy URL; drop it so memory and sockets
+        # don't grow with every proxy this thread tests.
+        for adapter in session.adapters.values():
+            manager = adapter.proxy_manager.pop(proxy_url, None)
+            if manager is not None:
+                manager.clear()
+
+
+def write_sorted(path, results):
+    """Atomically rewrite the output file with working proxies, fastest first."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".proxies-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("# Working HTTP/HTTPS Proxies (sorted by latency, fastest first)\n")
+            f.write("# Generated: " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
+            for proxy, _ in sorted(results, key=lambda item: item[1]):
+                f.write(f"{proxy}\n")
+        os.replace(tmp_path, path)
+    except BaseException:
+        os.unlink(tmp_path)
+        raise
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Scrape public HTTP proxies and check which ones work.")
+    parser.add_argument("-t", "--threads", type=int, default=THREADS, help=f"concurrent checks (default: {THREADS})")
+    parser.add_argument("--timeout", type=float, default=TIMEOUT, help=f"read timeout in seconds (default: {TIMEOUT})")
+    parser.add_argument("--connect-timeout", type=float, default=CONNECT_TIMEOUT,
+                        help=f"connect timeout in seconds (default: {CONNECT_TIMEOUT})")
+    parser.add_argument("-o", "--output", default=OUTPUT_FILE, help=f"output file (default: {OUTPUT_FILE})")
+    parser.add_argument("--test-url", default=TEST_URL, help=f"URL fetched through each proxy (default: {TEST_URL})")
+    parser.add_argument("--expect", default=EXPECT,
+                        help=f"substring the test response must contain; empty to disable (default: {EXPECT!r})")
+    parser.add_argument("-q", "--quiet", action="store_true", help="don't print each working proxy as it's found")
+    args = parser.parse_args()
+    if args.threads < 1:
+        parser.error("--threads must be at least 1")
+    return args
+
 
 def main():
-    # Clear and test file
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            f.write("# Working HTTP/HTTPS Proxies\n")
-            f.write("# Generated: " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
-        console.print(f"[green]✓ Created output file: {OUTPUT_FILE}[/green]")
-    except Exception as e:
-        console.print(f"[red]Failed to create output file: {e}[/red]")
-        return
+    args = parse_args()
 
     console.print(Panel("[bold cyan]HTTPS Proxy Scraper[/bold cyan]", expand=False))
-    console.print(f"[*] Timeout: [bold yellow]{TIMEOUT}s[/bold yellow] | Threads: [bold yellow]{THREADS}[/bold yellow]")
-    
-    # 1. Scraping Sources
-    raw_list = set()
-    source_counts = {}
-    
-    with console.status("[bold white]Fetching proxy lists..."):
-        for i, url in enumerate(SOURCES, 1):
-            try:
-                source_name = url.split('/')[-1].split('?')[0][:20]
-                console.print(f"  Fetching {i}/{len(SOURCES)}: {source_name}...")
-                
-                res = requests.get(url, timeout=10)
-                extracted = [p.strip() for p in res.text.splitlines() if ":" in p and p.strip()]
-                raw_list.update(extracted)
-                source_counts[source_name] = len(extracted)
-                
-                console.print(f"    → Found {len(extracted)} proxies")
-            except Exception as e:
-                console.print(f"    [red]→ Failed: {str(e)[:50]}[/red]")
-                continue
+    console.print(
+        f"[*] Timeout: [bold yellow]{args.connect_timeout}s connect / {args.timeout}s read[/bold yellow]"
+        f" | Threads: [bold yellow]{args.threads}[/bold yellow]"
+    )
 
-    if not raw_list:
+    # 1. Scrape all sources in parallel
+    with console.status("[bold white]Fetching proxy lists..."):
+        proxies = fetch_all_sources(SOURCES)
+
+    if not proxies:
         console.print("[red]No proxies found from any source![/red]")
         return
 
-    # 2. Validate proxies format
-    valid_proxies = []
-    invalid_count = 0
-    
-    for p in raw_list:
-        try:
-            ip, port = p.split(":")
-            # Basic validation
-            if len(ip.split('.')) == 4 and port.isdigit():
-                valid_proxies.append(p)
-            else:
-                invalid_count += 1
-        except:
-            invalid_count += 1
+    console.print(f"\n[*] Unique proxies to test: [bold cyan]{len(proxies)}[/bold cyan]\n")
 
-    # 3. Setup Queue
-    proxy_queue = Queue()
-    for p in valid_proxies:
-        proxy_queue.put(p)
-
-    console.print(f"\n[*] Proxy summary:")
-    console.print(f"  • Total fetched: [bold cyan]{len(raw_list)}[/bold cyan]")
-    console.print(f"  • Valid format: [bold green]{len(valid_proxies)}[/bold green]")
-    console.print(f"  • Invalid format: [bold yellow]{invalid_count}[/bold yellow]")
-    console.print(f"\n[*] Starting testing with {THREADS} threads...\n")
-
-    # 4. Execution
-    start_run = time.time()
-    threads = []
-    for _ in range(min(THREADS, len(valid_proxies))):
-        t = threading.Thread(target=test_worker, args=(proxy_queue,), daemon=True)
-        t.start()
-        threads.append(t)
-    
-    # Wait for completion with progress updates
-    while any(t.is_alive() for t in threads):
-        time.sleep(1)
-        with stats_lock:
-            scanned = stats["scanned"]
-            found = stats["found"]
-            console.print(f"  Progress: {scanned}/{len(valid_proxies)} | Found: {found}", end='\r')
-    
-    # Block until finished
-    proxy_queue.join()
-    
-    duration = round(time.time() - start_run, 2)
-    
-    # Final summary
-    console.print("\n" + "━" * 50)
-    console.print("[bold green]✓ SCANNING COMPLETE[/bold green]")
-    console.print(f"• Total scanned: [bold white]{stats['scanned']}[/bold white]")
-    console.print(f"• Working proxies: [bold green]{stats['found']}[/bold green]")
-    console.print(f"• Failed: [bold red]{stats['failed']}[/bold red]")
-    console.print(f"• Time taken: {duration}s")
-    
-    # Verify file contents
+    # 2. Open the output file once; each hit is appended and flushed immediately
     try:
-        with open(OUTPUT_FILE, 'r') as f:
-            lines = [l.strip() for l in f.readlines() if l.strip() and not l.startswith('#')]
-            console.print(f"• Proxies in file: [bold cyan]{len(lines)}[/bold cyan]")
-            
-        if len(lines) != stats['found']:
-            console.print("[yellow]⚠ Warning: File count doesn't match found proxies![/yellow]")
-        elif len(lines) > 0:
-            console.print(f"[green]✓ Successfully saved {len(lines)} proxies to {OUTPUT_FILE}[/green]")
-            console.print(f"  First few proxies: {', '.join(lines[:3])}")
-        else:
-            console.print("[red]✗ No proxies were saved to the file![/red]")
-    except Exception as e:
-        console.print(f"[red]Error reading output file: {e}[/red]")
-    
+        out = open(args.output, "w", encoding="utf-8")
+    except OSError as e:
+        console.print(f"[red]Failed to create output file: {e}[/red]")
+        return
+    out.write("# Working HTTP/HTTPS Proxies\n")
+    out.write("# Generated: " + time.strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
+    out.flush()
+
+    # 3. Check proxies concurrently
+    results = []
+    failed = 0
+    interrupted = False
+    start_run = time.perf_counter()
+
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold]Testing"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("| [green]{task.fields[alive]} alive"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    pool = ThreadPoolExecutor(max_workers=min(args.threads, len(proxies)))
+    try:
+        with progress:
+            task = progress.add_task("test", total=len(proxies), alive=0)
+            futures = {pool.submit(check_proxy, p, args): p for p in proxies}
+            for future in as_completed(futures):
+                proxy = futures[future]
+                latency = future.result()
+                if latency is None:
+                    failed += 1
+                else:
+                    results.append((proxy, latency))
+                    out.write(f"{proxy}\n")
+                    out.flush()
+                    if not args.quiet:
+                        progress.console.print(
+                            f"[bold green][ALIVE][/bold green] {proxy:<22} | [cyan]{latency}ms[/cyan]"
+                        )
+                progress.update(task, advance=1, alive=len(results))
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[red]Interrupted — stopping and saving what was found so far...[/red]")
+    finally:
+        pool.shutdown(wait=not interrupted, cancel_futures=True)
+        out.close()
+
+    duration = round(time.perf_counter() - start_run, 2)
+
+    # 4. Rewrite the file sorted by latency so the fastest proxies come first
+    if results:
+        try:
+            write_sorted(args.output, results)
+        except OSError as e:
+            console.print(f"[yellow]⚠ Could not sort output file ({e}); unsorted results kept.[/yellow]")
+
+    scanned = len(results) + failed
+    console.print("\n" + "━" * 50)
+    console.print("[bold yellow]⚠ SCANNING INTERRUPTED[/bold yellow]" if interrupted
+                  else "[bold green]✓ SCANNING COMPLETE[/bold green]")
+    console.print(f"• Total scanned: [bold white]{scanned}[/bold white]")
+    console.print(f"• Working proxies: [bold green]{len(results)}[/bold green]")
+    console.print(f"• Failed: [bold red]{failed}[/bold red]")
+    console.print(f"• Time taken: {duration}s" + (f" ({scanned / duration:.0f} checks/s)" if duration else ""))
+    if results:
+        fastest = sorted(results, key=lambda item: item[1])[:3]
+        console.print(f"[green]✓ Saved {len(results)} proxies to {args.output} (fastest first)[/green]")
+        console.print("  Fastest: " + ", ".join(f"{p} ({ms}ms)" for p, ms in fastest))
+    else:
+        console.print("[red]✗ No working proxies found.[/red]")
     console.print("━" * 50)
+
 
 if __name__ == "__main__":
     try:
